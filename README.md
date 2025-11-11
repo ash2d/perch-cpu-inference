@@ -9,6 +9,22 @@ High-performance bird species classification using Google's Perch v2 model for l
 
 ## Quick Start
 
+### Prerequisites
+
+This repository uses Git LFS for storing large model files. Install Git LFS before cloning:
+
+```bash
+# Install Git LFS
+git lfs install
+
+# Clone the repository
+git clone https://github.com/nilomr/perch-cpu-inference.git
+cd perch-cpu-inference
+
+# Pull LFS files
+git lfs pull
+```
+
 ### 1. Install Dependencies
 
 ```bash
@@ -48,8 +64,8 @@ python visualize.py test-data/wren-test.wav output-onnx/predictions_partitioned/
 ├── perch-tflite-inference.py    # TFLite inference script
 ├── visualize.py                 # Visualization tool
 ├── models/
-│   └── perch_v2/               # Pre-trained models
-│       ├── perch_v2.onnx       # ONNX model
+│   └── perch_v2/               # Pre-trained models (stored in Git LFS)
+│       ├── perch_v2.onnx       # ONNX model (~750MB)
 │       ├── perch_v2.tflite     # TFLite model
 │       ├── classes.json        # Species classes
 │       └── metadata files
