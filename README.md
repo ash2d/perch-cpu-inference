@@ -1,4 +1,4 @@
-# Phenoscale Bioacoustics - Perch v2 Inference
+# PhenoScale Bioacoustics - Perch v2 Inference
 
 High-performance bird species classification using Google's Perch v2 model for large-scale bioacoustics inference on CPUs. Work in progress.
 
