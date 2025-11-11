@@ -11,47 +11,41 @@ High-performance bird species classification using Google's Perch v2 model for l
 
 ### Prerequisites
 
-This repository uses Git LFS for storing large model files. Install Git LFS before cloning:
-
-```bash
-# Install Git LFS
-git lfs install
-
-# Clone the repository
-git clone https://github.com/nilomr/perch-cpu-inference.git
-cd perch-cpu-inference
-
-# Pull LFS files
-git lfs pull
-```
-
 ### 1. Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Run ONNX Inference
+### 2. Download or Compile Models
+
+**ONNX Model:**
+Download the pre-optimized ONNX model:
+```bash
+wget https://huggingface.co/justinchuby/Perch-onnx/resolve/main/perch_v2.onnx -P models/perch_v2/
+```
+
+**TFLite Model:**
+Compile the model from TensorFlow Hub:
+```bash
+python perch-tflite-inference.py compile-model
+```
+
+### 3. Run ONNX Inference
 
 ```bash
 python perch-onnx-inference.py --audio-dir ./test-data --output-dir ./output-onnx
 ```
 
-### 3. Run TFLite Inference
+### 4. Run TFLite Inference
 
-First, compile the model (downloads and converts Perch v2):
-
-```bash
-python perch-tflite-inference.py compile-model
-```
-
-Then run inference:
+First, ensure the model is compiled (see step 2), then run inference:
 
 ```bash
 python perch-tflite-inference.py run-inference ./test-data
 ```
 
-### 4. Visualize Results
+### 5. Visualize Results
 
 ```bash
 python visualize.py test-data/wren-test.wav output-onnx/predictions_partitioned/checkpoint_0000.csv --output visualization.png
@@ -64,9 +58,9 @@ python visualize.py test-data/wren-test.wav output-onnx/predictions_partitioned/
 ├── perch-tflite-inference.py    # TFLite inference script
 ├── visualize.py                 # Visualization tool
 ├── models/
-│   └── perch_v2/               # Pre-trained models (stored in Git LFS)
-│       ├── perch_v2.onnx       # ONNX model (~750MB)
-│       ├── perch_v2.tflite     # TFLite model
+│   └── perch_v2/               # Model directory (models downloaded separately)
+│       ├── perch_v2.onnx       # ONNX model (~750MB, download separately)
+│       ├── perch_v2.tflite     # TFLite model (compile using script)
 │       ├── classes.json        # Species classes
 │       └── metadata files
 ├── test-data/                  # Sample audio files
