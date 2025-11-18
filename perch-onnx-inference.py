@@ -1,18 +1,43 @@
 """
-Perch v2 ONNX - Production version - parallel inference on CPU
+Perch v2 ONNX - Production version - Memory-aware parallel inference on CPU
 """
 
+import sys
+import os
+
+
+# CRITICAL: Parse max_cpus BEFORE any other imports
+def _parse_max_cpus():
+    """Extract --max-cpus from command line before imports."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--max-cpus" and i + 1 < len(sys.argv):
+            try:
+                return int(sys.argv[i + 1])
+            except ValueError:
+                pass
+    return None
+
+
+# Set thread limits BEFORE importing numpy/onnx
+_max_cpus_override = _parse_max_cpus()
+if _max_cpus_override is not None:
+    os.environ["OMP_NUM_THREADS"] = str(_max_cpus_override)
+    os.environ["MKL_NUM_THREADS"] = str(_max_cpus_override)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(_max_cpus_override)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(_max_cpus_override)
+
+# NOW import everything else
 from pathlib import Path
 import json
 import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 import warnings
-import os
 import tempfile
 import shutil
-from typing import Dict
+from typing import Dict, List, Tuple
 from datetime import datetime
+import gc
 
 import numpy as np
 import pandas as pd
@@ -46,7 +71,8 @@ console = Console()
 
 SAMPLE_RATE = 32000
 CHUNK_SIZE = 160000  # 5 seconds
-CHECKPOINT_INTERVAL = 100  # Save every N batches
+CHUNK_MEMORY_MB = (CHUNK_SIZE * 4) / (1024 * 1024)  # float32 = 4 bytes per sample
+MEMORY_OVERHEAD_FACTOR = 1.5  # Account for metadata, copies, etc.
 
 warnings.filterwarnings("ignore")
 
@@ -115,26 +141,19 @@ def save_checkpoint(
 def write_embeddings_partitioned(
     output_dir: Path, df: pd.DataFrame, checkpoint_id: int, use_float16: bool = False
 ):
-    """
-    Write embeddings to partitioned parquet dataset.
-    Files are partitioned by checkpoint_id to keep files manageable.
-    """
+    """Write embeddings to partitioned parquet dataset."""
     emb_array = np.stack(df["embeddings"].values)
 
-    # Optional: quantize to float16 for 50% size reduction
     if use_float16:
         emb_array = emb_array.astype(np.float16)
 
-    # Create dataframe with embeddings
     emb_df = df[["file", "file_path", "chunk_idx", "start_time", "end_time"]].copy()
     emb_cols = {f"emb_{i}": emb_array[:, i] for i in range(emb_array.shape[1])}
     emb_df = emb_df.assign(**emb_cols)
     emb_df["checkpoint_id"] = checkpoint_id
 
-    # Convert to PyArrow Table
     table = pa.Table.from_pandas(emb_df)
 
-    # Write to partitioned dataset with proper format specification
     pq_format = ds.ParquetFileFormat()
     ds.write_dataset(
         table,
@@ -149,7 +168,7 @@ def write_embeddings_partitioned(
 def write_predictions_partitioned(
     output_dir: Path, df: pd.DataFrame, classes: list, checkpoint_id: int
 ):
-    """Write predictions to partitioned dataset (CSV for easy inspection)."""
+    """Write predictions to partitioned dataset."""
     top10_rows = []
     for _, row in df.iterrows():
         top10_indices = np.argsort(row["logits"])[-10:][::-1]
@@ -170,8 +189,6 @@ def write_predictions_partitioned(
         )
 
     pred_df = pd.DataFrame(top10_rows)
-
-    # Save to checkpoint-specific CSV file
     pred_dir = output_dir / "predictions_partitioned"
     pred_dir.mkdir(exist_ok=True)
     pred_file = pred_dir / f"checkpoint_{checkpoint_id:04d}.csv"
@@ -258,6 +275,43 @@ def process_batch(batch_chunks: list) -> list:
     ]
 
 
+def estimate_avg_chunks_per_file(
+    sample_files: List[str], max_samples: int = 10
+) -> float:
+    """Estimate average chunks per file from a sample."""
+    total_chunks = 0
+    valid_files = 0
+
+    for file_path in sample_files[:max_samples]:
+        try:
+            info = sf.info(file_path)
+            duration = info.duration
+            chunks = int(np.ceil(duration / 5.0))  # 5 seconds per chunk
+            total_chunks += chunks
+            valid_files += 1
+        except Exception:
+            continue
+
+    if valid_files == 0:
+        return 12  # Default: assume 60-second files = 12 chunks
+
+    return total_chunks / valid_files
+
+
+def calculate_file_group_size(max_ram_gb: float, avg_chunks_per_file: float) -> int:
+    """Calculate how many files can fit in RAM budget."""
+    max_ram_mb = max_ram_gb * 1024
+    memory_per_chunk_mb = CHUNK_MEMORY_MB * MEMORY_OVERHEAD_FACTOR
+    memory_per_file_mb = memory_per_chunk_mb * avg_chunks_per_file
+
+    files_per_group = int(max_ram_mb / memory_per_file_mb)
+
+    # Safety margin: use 80% of calculated capacity
+    files_per_group = max(1, int(files_per_group * 0.8))
+
+    return files_per_group
+
+
 @app.callback(invoke_without_command=True)
 def main(
     audio_dir: Path = typer.Option(..., "--audio-dir", "-d", help="Audio directory"),
@@ -274,38 +328,34 @@ def main(
         8, "--loader-threads", "-l", help="File loader threads"
     ),
     checkpoint_interval: int = typer.Option(
-        CHECKPOINT_INTERVAL,
-        "--checkpoint-interval",
-        "-c",
-        help="Save results every N batches",
+        200, "--checkpoint-interval", "-c", help="Save results every N batches"
     ),
     use_float16: bool = typer.Option(
-        False, "--float16/--float32", help="Use float16 for embeddings (50% smaller)"
+        False, "--float16/--float32", help="Use float16 for embeddings"
     ),
     resume: bool = typer.Option(
         True, "--resume/--no-resume", help="Resume from checkpoint"
     ),
+    max_cpus: int = typer.Option(
+        None, "--max-cpus", help="Maximum total CPUs to use (default: all available)"
+    ),
+    max_ram_gb: float = typer.Option(
+        20.0, "--max-ram-gb", help="Maximum RAM budget in GB (default: 20)"
+    ),
 ):
     """
-    High-performance ONNX inference with optimized storage
-
-    - Partitioned parquet datasets (efficient for massive datasets)
-    - Optional float16 compression (50% size reduction)
-    - Top 10 species predictions
-    - Incremental checkpointing
-
-    Storage improvements:
-    - Embeddings: Partitioned parquet (no CSV)
-    - Predictions: Partitioned CSV files
-    - Target file size: ~500MB per partition
+    Memory-aware ONNX inference with CPU control.
 
     Example:
-        python script.py --audio-dir ./audio --output-dir ./output --workers 16 --float16
+        # Use 20GB RAM, 16 CPUs total
+        python perch-onnx-inference.py --audio-dir ./audio --workers 4 --max-cpus 16 --max-ram-gb 20
+
+        # Use 50GB RAM, all CPUs
+        python perch-onnx-inference.py --audio-dir ./audio --workers 8 --max-ram-gb 50
     """
     output_dir.mkdir(exist_ok=True)
     checkpoint_path = output_dir / ".checkpoint.json"
 
-    # Load checkpoint
     checkpoint_data = (
         load_checkpoint(checkpoint_path)
         if resume
@@ -313,14 +363,13 @@ def main(
     )
     processed_files = checkpoint_data["processed_files"]
     current_checkpoint_id = checkpoint_data["checkpoint_id"]
+    total_batches = checkpoint_data["total_batches"]
 
-    # Find all files
     all_files = sorted([str(f) for p in ["*.wav", "*.WAV"] for f in audio_dir.glob(p)])
     if not all_files:
         console.print("[red]x No files found[/red]")
         return
 
-    # Filter unprocessed files
     files = [f for f in all_files if f not in processed_files]
 
     if not files:
@@ -332,9 +381,21 @@ def main(
             f"[green]v Resuming: {len(processed_files)} done, {len(files)} remaining[/green]"
         )
 
-    # Config
-    total_cpus = os.cpu_count() or 8
+    # Estimate memory requirements
+    console.print("[cyan]Estimating memory requirements...[/cyan]")
+    avg_chunks = estimate_avg_chunks_per_file(files, max_samples=min(10, len(files)))
+    files_per_group = calculate_file_group_size(max_ram_gb, avg_chunks)
+
+    # CPU configuration
+    system_cpus = os.cpu_count() or 8
+    total_cpus = max_cpus if max_cpus is not None else system_cpus
+    total_cpus = min(total_cpus, system_cpus)
     threads_per_worker = max(1, total_cpus // workers)
+
+    # Calculate file groups
+    file_groups = [
+        files[i : i + files_per_group] for i in range(0, len(files), files_per_group)
+    ]
 
     config_table = Table(title="Configuration", box=box.ROUNDED, show_header=False)
     config_table.add_column("Setting", style="cyan", width=30)
@@ -342,190 +403,239 @@ def main(
     config_table.add_row("Total Files", f"{len(all_files):,}")
     config_table.add_row("Already Processed", f"{len(processed_files):,}")
     config_table.add_row("To Process", f"{len(files):,}")
-    config_table.add_row("Loader Threads", str(loader_threads))
+    config_table.add_row("Avg Chunks/File", f"{avg_chunks:.1f}")
+    config_table.add_row("RAM Budget", f"{max_ram_gb:.1f} GB")
+    config_table.add_row("Files per Group", f"{files_per_group:,}")
+    config_table.add_row("Total Groups", f"{len(file_groups):,}")
+    config_table.add_row("System CPUs", str(system_cpus))
+    config_table.add_row("Max CPUs (limit)", str(total_cpus))
     config_table.add_row("Inference Workers", str(workers))
+    config_table.add_row("Threads per Worker", str(threads_per_worker))
+    config_table.add_row("Loader Threads", str(loader_threads))
     config_table.add_row("Batch Size", str(batch_size))
     config_table.add_row("Checkpoint Interval", f"Every {checkpoint_interval} batches")
     config_table.add_row("Embedding Format", "float16" if use_float16 else "float32")
-    config_table.add_row("Storage Format", "Partitioned Parquet")
-    config_table.add_row("Top Species", "10")
-    config_table.add_row("CPUs", str(total_cpus))
     console.print(config_table)
     console.print()
 
-    # Storage info
-    console.print(
-        Panel.fit(
-            "[bold cyan]Storage Optimization[/bold cyan]\n"
-            f"[dim]Embeddings: Partitioned by checkpoint_id (parquet only)[/dim]\n"
-            f"[dim]Predictions: Partitioned CSV files[/dim]\n"
-            f"[dim]Compression: {'float16 (50% smaller)' if use_float16 else 'float32 (standard)'}[/dim]",
-            border_style="cyan",
+    # Verify thread limits
+    env_threads = os.environ.get("OMP_NUM_THREADS", "unset")
+    if env_threads != "unset":
+        console.print(
+            Panel.fit(
+                f"[bold green]CPU Limiting Active[/bold green]\n"
+                f"[dim]OMP_NUM_THREADS={env_threads}[/dim]\n"
+                f"[dim]Each worker will use max {threads_per_worker} threads[/dim]",
+                border_style="green",
+            )
         )
-    )
+    else:
+        console.print(
+            Panel.fit(
+                "[bold yellow]Warning: No CPU limit set[/bold yellow]\n"
+                "[dim]Workers may use all available cores[/dim]",
+                border_style="yellow",
+            )
+        )
     console.print()
 
-    # STEP 1: Parallel file loading
-    console.print(
-        Panel.fit(
-            f"[bold cyan]Step 1: Loading {len(files):,} files[/bold cyan]",
-            border_style="cyan",
-        )
-    )
-
-    all_chunks = []
-    file_to_chunks = {}
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(bar_width=40),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("[cyan]Loading...", total=len(files))
-
-        with ThreadPoolExecutor(max_workers=loader_threads) as executor:
-            future_to_file = {executor.submit(load_single_file, f): f for f in files}
-
-            for future in as_completed(future_to_file):
-                file_path = future_to_file[future]
-                chunks = future.result()
-
-                if chunks:
-                    start_idx = len(all_chunks)
-                    all_chunks.extend(chunks)
-                    end_idx = len(all_chunks)
-                    file_to_chunks[file_path] = (start_idx, end_idx)
-
-                progress.update(task, advance=1)
-
-    console.print(f"[green]v[/green] Loaded {len(all_chunks):,} chunks\n")
-
-    if not all_chunks:
-        console.print("[red]x No chunks to process[/red]")
-        return
-
-    # STEP 2: Create batches
-    batches = [
-        all_chunks[i : i + batch_size] for i in range(0, len(all_chunks), batch_size)
-    ]
-
-    console.print(
-        Panel.fit(
-            f"[bold green]Step 2: Running inference ({len(batches):,} batches)[/bold green]\n"
-            f"[dim]{workers} workers, checkpoints every {checkpoint_interval} batches[/dim]",
-            border_style="green",
-        )
-    )
-    console.print()
-
-    # Load class names
     classes = json.load(open(classes_json))
 
-    # STEP 3: Parallel inference with optimized storage
+    # Initialize worker pool once
     init_fn = partial(init_worker, str(model_path), threads_per_worker)
-    chunksize = max(1, len(batches) // (workers * 4))
 
-    batch_buffer = []
-    processed_chunk_indices = set()
-    batch_count = 0
+    total_files_processed = 0
+    overall_timer = Timer()
+    overall_timer.__enter__()
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(bar_width=40),
-        MofNCompleteColumn(),
-        TextColumn("•"),
-        TimeElapsedColumn(),
-        TextColumn("•"),
-        TimeRemainingColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task(
-            f"[bold green]Processing ({workers} workers)", total=len(batches)
+    # Process file groups sequentially
+    for group_idx, file_group in enumerate(file_groups):
+        console.print(
+            Panel.fit(
+                f"[bold cyan]Processing Group {group_idx + 1}/{len(file_groups)}[/bold cyan]\n"
+                f"[dim]Files: {len(file_group):,} | "
+                f"Est. RAM: {len(file_group) * avg_chunks * CHUNK_MEMORY_MB * MEMORY_OVERHEAD_FACTOR:.1f} MB[/dim]",
+                border_style="cyan",
+            )
         )
 
-        with Timer() as t, mp.Pool(workers, initializer=init_fn) as pool:
-            for batch_results in pool.imap(process_batch, batches, chunksize=chunksize):
-                batch_buffer.extend(batch_results)
-                batch_count += 1
+        # STEP 1: Load files in this group
+        all_chunks = []
+        file_to_chunks = {}
 
-                for res in batch_results:
-                    processed_chunk_indices.add((res["file_path"], res["chunk_idx"]))
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=40),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(
+                f"[cyan]Loading group {group_idx + 1}...", total=len(file_group)
+            )
 
-                progress.update(task, advance=1)
+            with ThreadPoolExecutor(max_workers=loader_threads) as executor:
+                future_to_file = {
+                    executor.submit(load_single_file, f): f for f in file_group
+                }
 
-                # Save incrementally
-                if batch_count % checkpoint_interval == 0 and batch_buffer:
-                    rows = [
-                        {
-                            "file": f"{Path(res['file_path']).stem}_{res['chunk_idx']}",
-                            **res,
-                        }
-                        for res in batch_buffer
-                    ]
-                    df = pd.DataFrame(rows)
+                for future in as_completed(future_to_file):
+                    file_path = future_to_file[future]
+                    chunks = future.result()
 
-                    # Write embeddings to partitioned dataset
-                    write_embeddings_partitioned(
-                        output_dir, df, current_checkpoint_id, use_float16
-                    )
+                    if chunks:
+                        start_idx = len(all_chunks)
+                        all_chunks.extend(chunks)
+                        end_idx = len(all_chunks)
+                        file_to_chunks[file_path] = (start_idx, end_idx)
 
-                    # Write predictions to partitioned files
-                    write_predictions_partitioned(
-                        output_dir, df, classes, current_checkpoint_id
-                    )
+                    progress.update(task, advance=1)
 
-                    # Determine completed files
-                    newly_completed = set()
-                    for file_path, (start_idx, end_idx) in file_to_chunks.items():
-                        num_chunks = end_idx - start_idx
-                        completed = sum(
-                            1 for fp, _ in processed_chunk_indices if fp == file_path
-                        )
-                        if completed == num_chunks:
-                            newly_completed.add(file_path)
+        console.print(f"[green]v[/green] Loaded {len(all_chunks):,} chunks\n")
 
-                    if newly_completed:
-                        processed_files.update(newly_completed)
+        if not all_chunks:
+            console.print("[yellow]! No chunks in this group, skipping[/yellow]\n")
+            continue
 
-                    # Save checkpoint
-                    current_checkpoint_id += 1
-                    save_checkpoint(
-                        checkpoint_path,
-                        processed_files,
-                        batch_count,
-                        current_checkpoint_id,
-                    )
-
-                    batch_buffer = []
-
-                    console.print(
-                        f"\n[dim]Checkpoint {current_checkpoint_id}: "
-                        f"{len(processed_files)}/{len(all_files)} files, "
-                        f"{batch_count}/{len(batches)} batches[/dim]"
-                    )
-
-    # Save remaining buffer
-    if batch_buffer:
-        rows = [
-            {"file": f"{Path(res['file_path']).stem}_{res['chunk_idx']}", **res}
-            for res in batch_buffer
+        # STEP 2: Create batches
+        batches = [
+            all_chunks[i : i + batch_size]
+            for i in range(0, len(all_chunks), batch_size)
         ]
-        df = pd.DataFrame(rows)
 
-        write_embeddings_partitioned(output_dir, df, current_checkpoint_id, use_float16)
-        write_predictions_partitioned(output_dir, df, classes, current_checkpoint_id)
+        console.print(
+            f"[green]Processing {len(batches):,} batches with {workers} workers[/green]\n"
+        )
 
-    # Final checkpoint
-    processed_files.update(files)
-    save_checkpoint(
-        checkpoint_path, processed_files, batch_count, current_checkpoint_id
-    )
+        # STEP 3: Parallel inference
+        chunksize = max(1, min(10, len(batches) // (workers * 2)))
 
-    console.print(f"\n[cyan]v Results saved to partitioned datasets[/cyan]")
+        batch_buffer = []
+        processed_chunk_indices = set()
+        group_batch_count = 0
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=40),
+            MofNCompleteColumn(),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(
+                f"[bold green]Inference ({workers} workers)", total=len(batches)
+            )
+
+            with mp.Pool(workers, initializer=init_fn) as pool:
+                for batch_results in pool.imap(
+                    process_batch, batches, chunksize=chunksize
+                ):
+                    batch_buffer.extend(batch_results)
+                    group_batch_count += 1
+                    total_batches += 1
+
+                    for res in batch_results:
+                        processed_chunk_indices.add(
+                            (res["file_path"], res["chunk_idx"])
+                        )
+
+                    progress.update(task, advance=1)
+
+                    # Save incrementally
+                    if group_batch_count % checkpoint_interval == 0 and batch_buffer:
+                        rows = [
+                            {
+                                "file": f"{Path(res['file_path']).stem}_{res['chunk_idx']}",
+                                **res,
+                            }
+                            for res in batch_buffer
+                        ]
+                        df = pd.DataFrame(rows)
+
+                        write_embeddings_partitioned(
+                            output_dir, df, current_checkpoint_id, use_float16
+                        )
+                        write_predictions_partitioned(
+                            output_dir, df, classes, current_checkpoint_id
+                        )
+
+                        # Check which files are complete
+                        newly_completed = set()
+                        for file_path, (start_idx, end_idx) in file_to_chunks.items():
+                            num_chunks = end_idx - start_idx
+                            completed = sum(
+                                1
+                                for fp, _ in processed_chunk_indices
+                                if fp == file_path
+                            )
+                            if completed == num_chunks:
+                                newly_completed.add(file_path)
+
+                        if newly_completed:
+                            processed_files.update(newly_completed)
+
+                        current_checkpoint_id += 1
+                        save_checkpoint(
+                            checkpoint_path,
+                            processed_files,
+                            total_batches,
+                            current_checkpoint_id,
+                        )
+
+                        batch_buffer = []
+
+                        console.print(
+                            f"[dim]Checkpoint {current_checkpoint_id}: "
+                            f"{len(processed_files)}/{len(all_files)} files complete[/dim]"
+                        )
+
+        # Save remaining buffer for this group
+        if batch_buffer:
+            rows = [
+                {
+                    "file": f"{Path(res['file_path']).stem}_{res['chunk_idx']}",
+                    **res,
+                }
+                for res in batch_buffer
+            ]
+            df = pd.DataFrame(rows)
+
+            write_embeddings_partitioned(
+                output_dir, df, current_checkpoint_id, use_float16
+            )
+            write_predictions_partitioned(
+                output_dir, df, classes, current_checkpoint_id
+            )
+
+            batch_buffer = []
+
+        # Mark all files in this group as complete
+        processed_files.update(file_group)
+        current_checkpoint_id += 1
+        save_checkpoint(
+            checkpoint_path, processed_files, total_batches, current_checkpoint_id
+        )
+
+        total_files_processed += len(file_group)
+
+        # Free memory before next group
+        del all_chunks
+        del file_to_chunks
+        del processed_chunk_indices
+        gc.collect()
+
+        console.print(
+            f"[green]v Group {group_idx + 1} complete[/green] "
+            f"[dim]({total_files_processed}/{len(files)} files)[/dim]\n"
+        )
+
+    overall_timer.__exit__(None, None, None)
+
+    console.print("\n[cyan]v Results saved to partitioned datasets[/cyan]")
 
     # Show storage info
     emb_dir = output_dir / "embeddings_partitioned"
@@ -539,7 +649,7 @@ def main(
         pred_size = sum(f.stat().st_size for f in pred_dir.rglob("*.csv"))
         console.print(f"[dim]Predictions size: {pred_size / 1e6:.2f} MB[/dim]")
 
-    # Clean up if done
+    # Clean up checkpoint if done
     if len(processed_files) == len(all_files):
         console.print("[green]v All complete! Removing checkpoint[/green]")
         try:
@@ -548,9 +658,7 @@ def main(
             pass
 
     # Results
-    num_files = len(files)
-    num_chunks = len(all_chunks)
-    speed = num_files * 60 / t.elapsed
+    speed = len(files) * 60 / overall_timer.elapsed
 
     results_table = Table(
         title="Performance Results", box=box.DOUBLE_EDGE, title_style="bold magenta"
@@ -558,29 +666,19 @@ def main(
     results_table.add_column("Metric", style="cyan")
     results_table.add_column("Value", style="green bold", justify="right")
 
-    results_table.add_row("Files Processed", f"{num_files:,}")
+    results_table.add_row("Files Processed", f"{len(files):,}")
     results_table.add_row("Total Completed", f"{len(processed_files):,}")
-    results_table.add_row("Chunks Processed", f"{num_chunks:,}")
-    results_table.add_row("Processing Time", f"{t.elapsed:.2f}s")
+    results_table.add_row("Total Running Time", f"{overall_timer.elapsed:.2f}s")
     results_table.add_row("Speed", f"{speed:.1f}x realtime")
-    results_table.add_row("Throughput", f"{num_files / t.elapsed:.2f} files/sec")
-    results_table.add_row("Partitions Created", str(current_checkpoint_id))
+    results_table.add_row(
+        "Throughput", f"{len(files) / overall_timer.elapsed:.2f} files/sec"
+    )
+    results_table.add_row(
+        "CPU Efficiency", f"{(workers * threads_per_worker) / system_cpus * 100:.1f}%"
+    )
+    results_table.add_row("Peak RAM Used", f"~{max_ram_gb:.1f} GB (budget)")
 
     console.print(results_table)
-
-    # Projection
-    files_in_10tb = 10_000_000
-    hours_for_10tb = (files_in_10tb / (num_files / t.elapsed)) / 3600
-    days_for_10tb = hours_for_10tb / 24
-
-    console.print()
-    projection_panel = Panel(
-        f"[yellow]10TB Dataset (~10M files):[/yellow]\n"
-        f"[bold white]{hours_for_10tb:.1f} hours ({days_for_10tb:.2f} days)[/bold white]",
-        title="Projection",
-        border_style="yellow",
-    )
-    console.print(projection_panel)
 
     console.print(
         f"\n[dim]Reading embeddings: dataset = pq.ParquetDataset('{emb_dir}')[/dim]"
