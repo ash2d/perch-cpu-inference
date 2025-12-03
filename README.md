@@ -12,7 +12,7 @@ This repository provides optimized inference tools for running Perch v2 on sound
 
 - **High-performance inference**: Optimized CPU inference with parallel processing; ONNX and TFLite model support
 - **Batch processing**: Large-scale dataset processing with checkpointing and resume functionality
-- **Visualization**: Spectrogram and prediction overlays for validating results
+- **Visualization**: Spectrogram and prediction overlays for validating results; detection time series charts
 - **Benchmarking**: Performance analysis tools
 - **Monitoring**: Background process management for long-running jobs
 
@@ -54,6 +54,13 @@ python perch-tflite-inference.py run-inference --audio-dir ./data/test-data
 python scripts/visualization/visualize.py data/test-data/wren-test.wav output/predictions_partitioned/checkpoint_0000.csv --output visualization.png
 ```
 
+### 5. Analyze detection time series
+
+```bash
+# Plot daily detection counts for top species (automatically includes A4-2, A4-3, etc.)
+python scripts/visualization/plot_detection_timeseries.py output/embeddings/2025/A4/predictions_partitioned/ --output detection_timeseries.png
+```
+
 ## Project structure
 
 ```
@@ -61,6 +68,9 @@ python scripts/visualization/visualize.py data/test-data/wren-test.wav output/pr
 │   ├── inference/             # Inference scripts
 │   ├── benchmark/             # Benchmarking tools
 │   └── visualization/         # Visualization and reporting
+│       ├── visualize.py                 # Single file visualization
+│       ├── plot_detection_timeseries.py # Time series charts
+│       └── ...                         # Other visualization scripts
 ├── docs/                      # Documentation
 │   ├── README.md             # Detailed usage guide
 │   └── INFERENCE_README.md   # Inference runner guide

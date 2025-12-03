@@ -49,6 +49,13 @@ python perch-tflite-inference.py run-inference --audio-dir ./data/test-data
 python scripts/visualization/visualize.py data/test-data/wren-test.wav output/predictions_partitioned/checkpoint_0000.csv --output visualization.png
 ```
 
+### 6. Analyze Detection Time Series
+
+```bash
+# Plot daily detection counts for top species from prediction outputs
+python scripts/visualization/plot_detection_timeseries.py output/embeddings/2025/A4/predictions_partitioned/ --output detection_timeseries.png --top-n 15
+```
+
 ## Project structure
 
 ```
@@ -63,8 +70,7 @@ python scripts/visualization/visualize.py data/test-data/wren-test.wav output/pr
 │       ├── visualize.py                 # Visualization tool
 │       ├── visualize-embeddings-class.py
 │       ├── visualize-embeddings-time.py
-│       ├── data-report-plots.py
-│       └── data-report.py
+│       └── plot_detection_timeseries.py # Time series charts
 ├── docs/
 │   ├── README.md                        # Detailed usage
 │   └── INFERENCE_README.md              # Inference runner guide
@@ -148,6 +154,28 @@ python perch-tflite-inference.py benchmark ./data/test-data
 
 - Spectrogram (0-12kHz)
 - Time-aligned predictions table
+
+### Detection Time Series
+
+The `plot_detection_timeseries.py` script analyzes prediction outputs to create basic time series plots of species detections:
+
+```bash
+python scripts/visualization/plot_detection_timeseries.py /path/to/predictions_dir --output plot.png --top-n 10 --logit-threshold 11.0
+```
+
+What does it do?
+- Aggregates detections by day from AudioMoth filename timestamps
+- Plots top N species by total detection count
+- Configurable logit threshold filtering (raw logit scores, can be negative)
+- Counts ALL detections above threshold, not just top predictions
+- **Automatically includes related site deployments** (e.g., A4-2, A4-3 when A4 is specified)
+- Saves plots to specified output file
+
+This is useful for quick exploratory analysis of species activity patterns over time, but **should really not used for anything serious without validation and proper modelling**.
+
+Sample output:
+
+![time series plot](/docs/B4-detections.png)
 
 ## Dependencies
 
