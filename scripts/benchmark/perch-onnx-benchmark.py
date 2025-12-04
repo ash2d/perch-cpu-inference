@@ -494,7 +494,7 @@ def calculate_speedup_analysis(all_results: List[Dict]) -> Dict:
 @app.command()
 def benchmark(
     script_path: Path = typer.Option(
-        "perch-onnx-inference.py",
+        "scripts/inference/perch-onnx-inference.py",
         "--script",
         "-s",
         help="Path to inference script",
