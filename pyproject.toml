@@ -1,0 +1,11 @@
+[project]
+name = "perch-cpu-inference"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datashader>=0.18.2",
+    "scikit-learn>=1.8.0",
+    "umap-learn>=0.5.11",
+]

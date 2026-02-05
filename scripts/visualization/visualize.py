@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
 Visualize model output for a single file.
+
+Now accepts an audio file path and a directory containing partitioned prediction
+CSVs (e.g., predictions_partitioned). It will load all checkpoint_*.csv files,
+match rows to the provided audio using filename stem logic, and plot only those
+predictions.
 """
 
 import argparse
 import json
 import re
+import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -14,10 +20,65 @@ from matplotlib.patches import Rectangle, FancyBboxPatch
 from matplotlib.collections import LineCollection
 import librosa
 from opensoundscape import Audio
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn, MofNCompleteColumn
+
+console = Console()
 
 
-def load_predictions(csv_path):
-    return pd.read_csv(csv_path)
+def load_predictions_dir(predictions_dir: Path) -> pd.DataFrame:
+    """Load all checkpoint_*.csv files from a predictions_partitioned directory."""
+    files = sorted(predictions_dir.glob("checkpoint_*.csv"))
+    if not files:
+        raise FileNotFoundError(f"No prediction CSVs found in {predictions_dir}")
+
+    parts = []
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=40),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Loading prediction CSVs...", total=len(files))
+        for f in files:
+            parts.append(pd.read_csv(f))
+            progress.update(task, advance=1)
+    return pd.concat(parts, ignore_index=True)
+
+
+def _matches_audio(file_field: str, file_path_field: str, audio_stem: str) -> bool:
+    """Return True if a dataframe row corresponds to the given audio stem."""
+    file_field = str(file_field or "")
+    file_path_field = str(file_path_field or "")
+
+    if file_path_field:
+        try:
+            if Path(file_path_field).stem == audio_stem:
+                return True
+        except Exception:
+            pass
+
+    if file_field:
+        m = re.match(r"^(.*?)(?:_(\d+))?$", file_field)
+        prefix = m.group(1) if m else file_field
+        if prefix == audio_stem or file_field.startswith(audio_stem):
+            return True
+
+    return False
+
+
+def filter_predictions_for_audio(predictions_df: pd.DataFrame, audio_path: Path) -> pd.DataFrame:
+    audio_stem = audio_path.stem
+    mask = predictions_df.apply(
+        lambda r: _matches_audio(r.get("file", ""), r.get("file_path", ""), audio_stem),
+        axis=1,
+    )
+    filtered = predictions_df[mask].copy()
+    if filtered.empty:
+        raise FileNotFoundError(f"No predictions matched audio file: {audio_path}")
+    return filtered
 
 
 def parse_chunk_idx(filename_stemmed):
@@ -354,6 +415,9 @@ def plot_visualization(audio_path, predictions_df, output_path=None):
     plt.tight_layout(rect=[0, 0, 1, 0.96])
 
     if output_path:
+        output_path = output_path+audio_path.name+".png"
+        output_path = Path(output_path)
+        os.makedirs(output_path.parent, exist_ok=True)
         plt.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="white")
         print(f"✓ Saved: {output_path}")
         print(
@@ -368,22 +432,26 @@ def plot_visualization(audio_path, predictions_df, output_path=None):
 def main():
     parser = argparse.ArgumentParser(description="Perch v2 output visualization")
     parser.add_argument("audio_file", help="Path to audio file")
-    parser.add_argument("predictions_csv", help="Path to predictions CSV")
-    parser.add_argument("--output", help="Output image path (optional)")
+    parser.add_argument(
+        "predictions_dir",
+        help="Path to predictions_partitioned directory containing checkpoint_*.csv",
+    )
+    parser.add_argument("--output", help="Output image dir (optional)")
 
     args = parser.parse_args()
 
     audio_path = Path(args.audio_file)
-    csv_path = Path(args.predictions_csv)
+    predictions_dir = Path(args.predictions_dir)
 
     if not audio_path.exists():
         print(f"✗ Audio file not found: {audio_path}")
         return
-    if not csv_path.exists():
-        print(f"✗ Predictions CSV not found: {csv_path}")
+    if not predictions_dir.exists():
+        print(f"✗ Predictions directory not found: {predictions_dir}")
         return
 
-    predictions = load_predictions(csv_path)
+    predictions_all = load_predictions_dir(predictions_dir)
+    predictions = filter_predictions_for_audio(predictions_all, audio_path)
     plot_visualization(audio_path, predictions, args.output)
 
 

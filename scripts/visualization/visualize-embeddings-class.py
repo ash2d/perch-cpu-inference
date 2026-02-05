@@ -7,6 +7,8 @@ Install:
 """
 
 import os
+import argparse
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -169,6 +171,55 @@ def extract_features(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, pd.DataF
     metadata_cols = ["file", "file_path", "chunk_idx", "start_time", "end_time"]
     metadata = df[metadata_cols].reset_index(drop=True)
     return embeddings, predicted_classes, metadata
+
+
+# ------------------------------ Audio filtering ------------------------------
+
+
+def _matches_audio(file_field: str, file_path_field: str, audio_stem: str) -> bool:
+    """Return True if a dataframe row corresponds to the given audio stem.
+
+    Mirrors the matching logic used in visualize.py: prefer exact stem match on
+    file_path, then fall back to prefix matching on `file`.
+    """
+
+    file_field = str(file_field or "")
+    file_path_field = str(file_path_field or "")
+
+    if file_path_field:
+        try:
+            if Path(file_path_field).stem == audio_stem:
+                return True
+        except Exception:
+            pass
+
+    if file_field:
+        m = re.match(r"^(.*?)(?:_(\d+))?$", file_field)
+        prefix = m.group(1) if m else file_field
+        if prefix == audio_stem or file_field.startswith(audio_stem):
+            return True
+
+    return False
+
+
+def filter_for_audio(df: pd.DataFrame, audio_path: Path) -> pd.DataFrame:
+    """Filter embeddings/predictions to rows that belong to the given audio file."""
+
+    audio_stem = audio_path.stem
+    mask = df.apply(
+        lambda r: _matches_audio(r.get("file", ""), r.get("file_path", ""), audio_stem),
+        axis=1,
+    )
+    filtered = df[mask].copy()
+    if filtered.empty:
+        console.print(
+            f"[yellow]No rows matched audio[/yellow]: {audio_path} (stem='{audio_stem}')"
+        )
+    else:
+        # Sort by chunk_idx if available to make downstream expectations clearer
+        if "chunk_idx" in filtered.columns:
+            filtered.sort_values("chunk_idx", inplace=True)
+    return filtered
 
 
 def get_top_classes(
@@ -627,16 +678,74 @@ def create_class_plot(
 # ------------------------------ Main ------------------------------
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="UMAP class visualization")
+    parser.add_argument(
+        "--embeddings-dir",
+        default=EMBEDDINGS_DIR,
+        help="Path to embeddings partition directory",
+    )
+    parser.add_argument(
+        "--predictions-dir",
+        default=PREDICTIONS_DIR,
+        help="Path to predictions CSV directory",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=OUTPUT_DIR,
+        help="Directory to write visualizations",
+    )
+    parser.add_argument(
+        "--audio-file",
+        type=str,
+        help="Optional audio file path to filter embeddings/predictions for that file only",
+    )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=MAX_FILES,
+        help="Limit number of parquet files loaded (for debugging)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=N_WORKERS,
+        help="Number of worker threads for parquet loading",
+    )
+    parser.add_argument(
+        "--top-classes",
+        type=int,
+        default=N_TOP_CLASSES,
+        help="How many top classes to label",
+    )
+    return parser.parse_args()
+
+
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    args = parse_args()
+
+    embeddings_dir = args.embeddings_dir
+    predictions_dir = args.predictions_dir
+    output_dir = args.output_dir
+    audio_path = Path(args.audio_file) if args.audio_file else None
+
+    os.makedirs(output_dir, exist_ok=True)
 
     console.print(Panel.fit("→ Loading embeddings...", border_style="cyan"))
-    df = load_embeddings(EMBEDDINGS_DIR, MAX_FILES, n_workers=N_WORKERS)
+    df = load_embeddings(embeddings_dir, args.max_files, n_workers=args.workers)
     console.print(f"  Loaded {len(df):,} vectors")
 
+    if audio_path is not None:
+        df = filter_for_audio(df, audio_path)
+        console.print(f"  Filtered embeddings for audio '{audio_path.name}': {len(df):,} rows")
+
     console.print(Panel.fit("→ Loading predictions...", border_style="cyan"))
-    df_pred = load_predictions(PREDICTIONS_DIR)
+    df_pred = load_predictions(predictions_dir)
     console.print(f"  Loaded {len(df_pred):,} predictions")
+
+    if audio_path is not None:
+        df_pred = filter_for_audio(df_pred, audio_path)
+        console.print(f"  Filtered predictions for audio '{audio_path.name}': {len(df_pred):,} rows")
 
     console.print(Panel.fit("→ Merging data...", border_style="cyan"))
     df = df.merge(
@@ -644,14 +753,22 @@ def main():
     )
     console.print(f"  Merged, {len(df):,} rows")
 
+    if audio_path is not None and "chunk_idx" in df.columns:
+        unique_chunks = sorted(df["chunk_idx"].dropna().unique())
+        console.print(
+            f"  Chunks found for audio: {len(unique_chunks)} (indices: {unique_chunks[:20]}{'...' if len(unique_chunks) > 20 else ''})"
+        )
+
     config_table = Table(title="Status", show_header=False)
     config_table.add_column("Setting", style="cyan")
     config_table.add_column("Value", style="green bold")
     config_table.add_row("Embedding rows", f"{len(df):,}")
     config_table.add_row("Prediction rows", f"{len(df_pred):,}")
     config_table.add_row("UMAP neighbors", str(UMAP_N_NEIGHBORS))
-    config_table.add_row("Top classes", str(N_TOP_CLASSES))
-    config_table.add_row("Workers", str(N_WORKERS))
+    config_table.add_row("Top classes", str(args.top_classes))
+    config_table.add_row("Workers", str(args.workers))
+    if audio_path is not None:
+        config_table.add_row("Audio file", audio_path.name)
     console.print(config_table)
 
     console.print(Panel.fit("→ Extracting features...", border_style="cyan"))
@@ -659,10 +776,10 @@ def main():
     console.print(f"  Processed {len(embeddings):,} samples")
 
     console.print(Panel.fit("→ Analyzing classes...", border_style="cyan"))
-    top_classes, class_indices = get_top_classes(predicted_classes, N_TOP_CLASSES)
+    top_classes, class_indices = get_top_classes(predicted_classes, args.top_classes)
     n_other = int((class_indices == 0).sum())
     console.print(
-        f"  Top {N_TOP_CLASSES} classes account for {len(predicted_classes) - n_other:,} points"
+        f"  Top {args.top_classes} classes account for {len(predicted_classes) - n_other:,} points"
     )
     console.print(f"  Other classes: {n_other:,} points")
 
@@ -679,17 +796,17 @@ def main():
         embeddings_2d = embeddings_2d.get()
 
     console.print(Panel.fit("→ Creating visualization...", border_style="cyan"))
-    create_class_plot(embeddings_2d, class_indices, top_classes, OUTPUT_DIR)
+    create_class_plot(embeddings_2d, class_indices, top_classes, output_dir)
 
     results = metadata.copy()
     results["umap_x"] = embeddings_2d[:, 0]
     results["umap_y"] = embeddings_2d[:, 1]
     results["predicted_class"] = predicted_classes
     results["class_index"] = class_indices
-    results.to_parquet(f"{OUTPUT_DIR}/umap_class_embeddings.parquet", index=False)
+    results.to_parquet(f"{output_dir}/umap_class_embeddings.parquet", index=False)
 
     console.print(
-        Panel.fit(f"\n✓ Complete! Output: {OUTPUT_DIR}/", border_style="green")
+        Panel.fit(f"\n✓ Complete! Output: {output_dir}/", border_style="green")
     )
 
 
